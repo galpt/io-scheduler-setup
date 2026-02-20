@@ -34,7 +34,10 @@ ensure_prereqs() {
   require_cmd lsblk
   require_cmd awk
   require_cmd udevadm
+  require_cmd sed
+  require_cmd grep
 }
+
 
 check_root_or_sudo() {
   if [ "$EUID" -ne 0 ]; then
@@ -58,8 +61,18 @@ USAGE
 }
 
 list_disks() {
-  # Produce an array of lines: name|rota|model|size
-  mapfile -t DISKS < <(lsblk -d -n -o NAME,ROTA,MODEL,SIZE,TYPE | awk '$5=="disk" {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $1"|"$2"|"$3"|"$4}')
+  # Use key="value" output (-P) to robustly parse fields (works for nvme names and
+  # models with spaces). Produce array entries: name|rota|model|size
+  mapfile -t DISKS < <(lsblk -dn -o NAME,ROTA,MODEL,SIZE,TYPE -P | while read -r line; do
+    name=$(echo "$line" | sed -n 's/.*NAME="\([^"]*\)".*/\1/p')
+    type=$(echo "$line" | sed -n 's/.*TYPE="\([^"]*\)".*/\1/p')
+    rota=$(echo "$line" | sed -n 's/.*ROTA="\([^"]*\)".*/\1/p')
+    model=$(echo "$line" | sed -n 's/.*MODEL="\([^"]*\)".*/\1/p')
+    size=$(echo "$line" | sed -n 's/.*SIZE="\([^"]*\)".*/\1/p')
+    if [ "$type" = "disk" ]; then
+      printf "%s|%s|%s|%s\n" "$name" "$rota" "$model" "$size"
+    fi
+  done)
 }
 
 show_disk_menu() {
@@ -126,7 +139,7 @@ apply_scheduler_now() {
   _green "Applied scheduler '$sched' to /sys/block/$dev/queue/scheduler"
 }
 
-udev_rule_path() { echo "/etc/udev/rules.d/60-io-scheduler.rules"; }
+udev_rule_path() { echo "/etc/udev/rules.d/99-io-scheduler.rules"; }
 
 make_udev_rule_for() {
   local dev=$1
@@ -140,11 +153,23 @@ make_udev_rule_for() {
   # Append a rule specific to this kernel device name
   # Use SUBSYSTEM=="block" so it matches block devices
   echo "# io-scheduler rule for $dev (created by $PROG_NAME)" >> "$rulefile"
-  echo "SUBSYSTEM==\"block\", KERNEL==\"$dev\", ATTR{queue/scheduler}==\"$sched\", OPTIONS+=\"last_rule\"" >> "$rulefile"
+  # Assignment rule (single '=') — file is named 99-* so it runs after all system
+  # defaults (e.g. 60-ioschedulers.rules from systemd-udev which sets nvme to 'none')
+  echo "SUBSYSTEM==\"block\", KERNEL==\"$dev\", ATTR{queue/scheduler}=\"$sched\"" >> "$rulefile"
   _green "Wrote rule to $rulefile"
-  # reload rules and trigger
-  udevadm control --reload-rules && udevadm trigger --action=change /sys/block/$dev || true
-  _green "Reloaded udev rules and triggered change for $dev"
+  # Reload udev rules, trigger a change event, then wait for async rule processing
+  udevadm control --reload-rules || true
+  udevadm trigger --action=change /sys/block/$dev || true
+  udevadm settle || true
+  # Verify the scheduler actually stuck
+  actual=$(cat "/sys/block/$dev/queue/scheduler" 2>/dev/null | sed -E 's/.*\[([^]]+)\].*/\1/' || true)
+  if [ "$actual" = "$sched" ]; then
+    _green "Confirmed: scheduler is now '$actual' on $dev"
+  else
+    _yellow "Note: current scheduler on $dev is '$actual' — applying directly to ensure session state."
+    echo "$sched" > "/sys/block/$dev/queue/scheduler" || true
+    _green "Re-applied '$sched' directly to /sys/block/$dev/queue/scheduler"
+  fi
 }
 
 remove_udev_rule_for() {
@@ -222,9 +247,35 @@ main_interactive() {
   if ask_yes_no "Create persistent udev rule to set scheduler for $SELECTED_NAME on boot?"; then
     # pick scheduler to persist (default to currently selected if any)
     cur=$(current_selected_scheduler "$sched_raw")
-    read -rp "Enter scheduler to persist [${cur}]: " persist_in
-    persist_in=${persist_in:-$cur}
-    # Validate
+    # If the user previously applied one immediately, prefer that as default
+    if [ -n "${sel_sched-}" ]; then
+      default_sched="$sel_sched"
+    else
+      default_sched="$cur"
+    fi
+
+    echo
+    echo "Choose scheduler to persist (enter number or name). Default: $default_sched"
+    j=1
+    for s in "${SCHED_TOKS[@]}"; do
+      printf "%3s %s\n" "$j" "$s"
+      ((j++))
+    done
+
+    read -rp "Enter number or scheduler name [${default_sched}]: " persist_in
+    persist_in=${persist_in:-$default_sched}
+
+    # If user entered a number, map it to the scheduler token
+    if [[ "$persist_in" =~ ^[0-9]+$ ]]; then
+      pi=$((persist_in-1))
+      if [ "$pi" -ge 0 ] && [ "$pi" -lt "${#SCHED_TOKS[@]}" ]; then
+        persist_in=${SCHED_TOKS[$pi]}
+      else
+        _red "Invalid scheduler selection '$persist_in' — aborting persistent rule creation."; exit 1
+      fi
+    fi
+
+    # Validate final scheduler name exists in list
     ok=0
     for s in "${SCHED_TOKS[@]}"; do
       if [ "$s" = "$persist_in" ]; then ok=1; break; fi
@@ -232,6 +283,14 @@ main_interactive() {
     if [ "$ok" -ne 1 ]; then
       _red "Invalid scheduler '$persist_in' — aborting persistent rule creation."; exit 1
     fi
+
+    # First, attempt to apply the scheduler immediately so the change takes effect now.
+    if apply_scheduler_now "$SELECTED_NAME" "$persist_in"; then
+      _green "Scheduler '$persist_in' applied immediately. Proceeding to persist rule."
+    else
+      _yellow "Warning: failed to apply scheduler '$persist_in' immediately. Will still create udev rule to set it on next udev event."
+    fi
+
     make_udev_rule_for "$SELECTED_NAME" "$persist_in"
   else
     _yellow "No persistent rule created."

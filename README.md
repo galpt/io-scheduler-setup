@@ -24,8 +24,10 @@ and persist a chosen scheduler across reboots using a udev rule.
 - Enumerates block disks with `lsblk` and shows model/size/rotational flag.
 - Reads available schedulers from `/sys/block/<dev>/queue/scheduler`.
 - Applies a scheduler immediately (writes to sysfs).
-- Optionally writes a udev rule at `/etc/udev/rules.d/60-io-scheduler.rules`
+- Optionally writes a udev rule at `/etc/udev/rules.d/99-io-scheduler.rules`
   to make the scheduler selection persistent across reboots.
+  The `99-` prefix ensures this rule runs after all system defaults
+  (e.g. `60-ioschedulers.rules` from systemd-udev which resets NVMe to `none`).
 - Provides `--remove <dev>` to remove rules created for a device.
 
 ## Requirements
@@ -53,7 +55,8 @@ sudo ./io-scheduler-setup.sh --remove sda
 ```
 
 > [!NOTE]
-> - Persistent udev rules are written to `/etc/udev/rules.d/60-io-scheduler.rules`.
+> - Persistent udev rules are written to `/etc/udev/rules.d/99-io-scheduler.rules`.
+> - The `99-` prefix guarantees this file is processed after system defaults that would otherwise override your choice.
 > - The script backs up an existing rule file before appending new entries.
 
 ## Examples
