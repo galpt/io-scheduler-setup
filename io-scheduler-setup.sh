@@ -107,15 +107,21 @@ prompt_select_disk() {
   done
 }
 
-# Detect I/O scheduler modules that exist on disk but are not currently loaded.
-# Returns space-separated names of schedulers that are loadable via modprobe.
+# Detect I/O scheduler modules that exist on disk but are not visible in
+# /sys/block/*/queue/scheduler (not loaded yet).  Takes the current sysfs
+# scheduler list as argument and returns names NOT already in it.
 find_module_schedulers() {
-  local modules
-  modules=""
-  # Known I/O scheduler module names
-  for mod in flow-iosched mq-deadline kyber bfq; do
+  local sysfs_list="$1"
+  local modules=""
+  # Only checks flow-iosched by default.  Built-in schedulers (mq-deadline,
+  # kyber, bfq) are always visible in sysfs when the kernel is running.
+  for mod in flow-iosched; do
+    # Does the module exist on disk?
     if modinfo -n "$mod" &>/dev/null; then
-      if ! lsmod 2>/dev/null | grep -q "^${mod%%-*}_iosched"; then
+      # Is it already visible in sysfs (already loaded)?
+      local in_sysfs
+      in_sysfs=$(echo "$sysfs_list" | tr ' ' '\n' | sed 's/\[//g; s/\]//g' | grep -cF "$mod")
+      if [ "$in_sysfs" -eq 0 ]; then
         modules="$modules $mod"
       fi
     fi
@@ -132,19 +138,17 @@ get_available_schedulers() {
   fi
   local sched_raw
   sched_raw=$(cat "$path" 2>/dev/null || true)
-  # sched_raw looks like: noop [mq-deadline] kyber or [none] mq-deadline
+  # sched_raw looks like: none [mq-deadline] kyber bfq
 
-  # Append any schedulers available as modules but not yet loaded
+  # Append any schedulers available as modules but not yet visible in sysfs
   local mod_scheds
-  mod_scheds=$(find_module_schedulers)
+  mod_scheds=$(find_module_schedulers "$sched_raw")
   for s in $mod_scheds; do
-    # Only add if not already in the list
-    if ! echo "$sched_raw" | tr ' ' '\n' | grep -qxF "$s"; then
-      sched_raw="$sched_raw $s"
-    fi
+    sched_raw="$sched_raw $s"
   done
 
-  echo "$sched_raw"
+  # Collapse multiple spaces — ensures clean menu even when appending
+  echo "$sched_raw" | tr -s ' '
 }
 
 current_selected_scheduler() {
