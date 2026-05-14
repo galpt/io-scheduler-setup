@@ -36,6 +36,9 @@ ensure_prereqs() {
   require_cmd udevadm
   require_cmd sed
   require_cmd grep
+  require_cmd modinfo
+  require_cmd modprobe
+  require_cmd lsmod
 }
 
 
@@ -104,6 +107,22 @@ prompt_select_disk() {
   done
 }
 
+# Detect I/O scheduler modules that exist on disk but are not currently loaded.
+# Returns space-separated names of schedulers that are loadable via modprobe.
+find_module_schedulers() {
+  local modules
+  modules=""
+  # Known I/O scheduler module names
+  for mod in flow-iosched mq-deadline kyber bfq; do
+    if modinfo -n "$mod" &>/dev/null; then
+      if ! lsmod 2>/dev/null | grep -q "^${mod%%-*}_iosched"; then
+        modules="$modules $mod"
+      fi
+    fi
+  done
+  echo "$modules"
+}
+
 get_available_schedulers() {
   local dev=$1
   local path="/sys/block/$dev/queue/scheduler"
@@ -111,9 +130,20 @@ get_available_schedulers() {
     echo ""
     return 1
   fi
+  local sched_raw
   sched_raw=$(cat "$path" 2>/dev/null || true)
   # sched_raw looks like: noop [mq-deadline] kyber or [none] mq-deadline
-  # produce space-separated list and mark selected with brackets stripped
+
+  # Append any schedulers available as modules but not yet loaded
+  local mod_scheds
+  mod_scheds=$(find_module_schedulers)
+  for s in $mod_scheds; do
+    # Only add if not already in the list
+    if ! echo "$sched_raw" | tr ' ' '\n' | grep -qxF "$s"; then
+      sched_raw="$sched_raw $s"
+    fi
+  done
+
   echo "$sched_raw"
 }
 
@@ -131,6 +161,22 @@ apply_scheduler_now() {
   local dev=$1
   local sched=$2
   local path="/sys/block/$dev/queue/scheduler"
+
+  # If the scheduler is not available in sysfs, try loading it as a module first
+  if ! cat "$path" 2>/dev/null | tr ' ' '\n' | grep -qxF "$sched"; then
+    if modinfo "$sched" &>/dev/null; then
+      _yellow "Module '$sched' exists but is not loaded — attempting modprobe ..."
+      modprobe "$sched" 2>/dev/null || {
+        _red "Failed to load module '$sched'."
+        return 1
+      }
+      _green "Module '$sched' loaded."
+    else
+      _red "Scheduler '$sched' is not available and no kernel module was found."
+      return 1
+    fi
+  fi
+
   if [ ! -w "$path" ]; then
     _red "Cannot write to $path — ensure kernel supports changing scheduler and run as root."
     return 1
@@ -150,9 +196,23 @@ make_udev_rule_for() {
   if [ -f "$rulefile" ]; then
     cp -a "$rulefile" "$rulefile.bak.$(date +%s)" || true
   fi
-  # Append a rule specific to this kernel device name
-  # Use SUBSYSTEM=="block" so it matches block devices
+  # Check if this scheduler requires loading a kernel module
+  local needs_module=false
+  if ! cat "/sys/block/$dev/queue/scheduler" 2>/dev/null | tr ' ' '\n' | grep -qxF "$sched"; then
+    if modinfo "$sched" &>/dev/null; then
+      needs_module=true
+    fi
+  fi
+
   echo "# io-scheduler rule for $dev (created by $PROG_NAME)" >> "$rulefile"
+
+  # If the scheduler needs a module, load it before setting the attribute.
+  # udev RUN directives execute as programs, and modprobe ensures the module
+  # and its dependencies are loaded.
+  if [ "$needs_module" = true ]; then
+    echo "ACTION==\"add\", SUBSYSTEM==\"block\", KERNEL==\"$dev\", RUN+=\"/sbin/modprobe $sched\"" >> "$rulefile"
+  fi
+
   # Assignment rule (single '=') — file is named 99-* so it runs after all system
   # defaults (e.g. 60-ioschedulers.rules from systemd-udev which sets nvme to 'none')
   echo "SUBSYSTEM==\"block\", KERNEL==\"$dev\", ATTR{queue/scheduler}=\"$sched\"" >> "$rulefile"
