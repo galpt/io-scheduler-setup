@@ -5,9 +5,12 @@ IFS=$'\n\t'
 # IO Scheduler interactive helper
 # Author: github.com/galpt
 # Purpose: detect block devices, show available I/O schedulers per-disk,
-# let user apply them immediately and persist them across reboots via udev rules.
+# let user apply them immediately and persist them across reboots
+# via a systemd oneshot service (more reliable than udev rules for
+# NVMe devices that initialise before the root filesystem is mounted).
 
 PROG_NAME=$(basename "$0")
+SERVICE_NAME="io-scheduler-setup"
 
 _green() { printf "\033[1;32m%s\033[0m\n" "$*"; }
 _yellow() { printf "\033[1;33m%s\033[0m\n" "$*"; }
@@ -33,7 +36,6 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "$( _red "ERROR" ): re
 ensure_prereqs() {
   require_cmd lsblk
   require_cmd awk
-  require_cmd udevadm
   require_cmd sed
   require_cmd grep
   require_cmd modinfo
@@ -189,62 +191,53 @@ apply_scheduler_now() {
   _green "Applied scheduler '$sched' to /sys/block/$dev/queue/scheduler"
 }
 
-udev_rule_path() { echo "/etc/udev/rules.d/99-io-scheduler.rules"; }
+systemd_service_path() {
+  echo "/etc/systemd/system/${SERVICE_NAME}@.service"
+}
 
-make_udev_rule_for() {
+make_systemd_service() {
   local dev=$1
   local sched=$2
-  local rulefile
-  rulefile=$(udev_rule_path)
-  # Backup existing rules if any
-  if [ -f "$rulefile" ]; then
-    cp -a "$rulefile" "$rulefile.bak.$(date +%s)" || true
-  fi
-  # Check if this scheduler requires loading a kernel module
-  local needs_module=false
-  if ! cat "/sys/block/$dev/queue/scheduler" 2>/dev/null | tr ' ' '\n' | grep -qxF "$sched"; then
-    if modinfo "$sched" &>/dev/null; then
-      needs_module=true
-    fi
-  fi
+  local unit
+  unit=$(systemd_service_path)
 
-  echo "# io-scheduler rule for $dev (created by $PROG_NAME)" >> "$rulefile"
+  # Create a template unit: io-scheduler-setup@nvme1n1.service
+  cat > "$unit" <<-UNITEOF
+[Unit]
+Description=Set I/O scheduler to %i
+After=local-fs.target
 
-  # If the scheduler needs a module, load it before setting the attribute.
-  # udev RUN directives execute as programs, and modprobe ensures the module
-  # and its dependencies are loaded.
-  if [ "$needs_module" = true ]; then
-    echo "ACTION==\"add\", SUBSYSTEM==\"block\", KERNEL==\"$dev\", RUN+=\"/sbin/modprobe $sched\"" >> "$rulefile"
-  fi
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo ${sched} > /sys/block/%i/queue/scheduler'
+RemainAfterExit=yes
 
-  # Assignment rule (single '=') — file is named 99-* so it runs after all system
-  # defaults (e.g. 60-ioschedulers.rules from systemd-udev which sets nvme to 'none')
-  echo "SUBSYSTEM==\"block\", KERNEL==\"$dev\", ATTR{queue/scheduler}=\"$sched\"" >> "$rulefile"
-  _green "Wrote rule to $rulefile"
-  udevadm control --reload-rules || true
-  # Apply for the current session directly (udev rule fires on next add event / reboot)
-  echo "$sched" > "/sys/block/$dev/queue/scheduler" || true
+[Install]
+WantedBy=default.target
+UNITEOF
+
+  # Enable the instance for this device
+  systemctl enable "${SERVICE_NAME}@${dev}.service" 2>/dev/null || true
+  systemctl start "${SERVICE_NAME}@${dev}.service" 2>/dev/null || true
+
+  _green "Created and enabled systemd service for $dev ($sched)"
   actual=$(cat "/sys/block/$dev/queue/scheduler" 2>/dev/null | sed -E 's/.*\[([^]]+)\].*/\1/' || true)
   if [ "$actual" = "$sched" ]; then
     _green "Confirmed: scheduler is now '$actual' on $dev"
   else
-    _yellow "Note: could not verify '$sched' on $dev (current: '$actual')."
+    _yellow "Note: scheduler on $dev is currently '$actual' (will be set on next boot)."
   fi
 }
 
-remove_udev_rule_for() {
+remove_systemd_service() {
   local dev=$1
-  local rulefile
-  rulefile=$(udev_rule_path)
-  if [ ! -f "$rulefile" ]; then
-    _yellow "No rulefile at $rulefile — nothing to remove."
-    return 0
+  if systemctl is-enabled "${SERVICE_NAME}@${dev}.service" &>/dev/null 2>&1; then
+    systemctl disable "${SERVICE_NAME}@${dev}.service" 2>/dev/null || true
+    systemctl stop "${SERVICE_NAME}@${dev}.service" 2>/dev/null || true
+    _green "Disabled systemd service for $dev"
+  else
+    _yellow "No systemd service found for $dev."
   fi
-  # remove lines mentioning this dev and created by this script
-  grep -v "created by $PROG_NAME" "$rulefile" | grep -v "KERNEL==\"$dev\"" > "$rulefile.tmp" || true
-  mv "$rulefile.tmp" "$rulefile"
-  _green "Removed rules for $dev from $rulefile"
-  udevadm control --reload-rules && udevadm trigger --action=change /sys/block/$dev || true
 }
 
 show_current_state() {
@@ -304,7 +297,7 @@ main_interactive() {
   done
 
   echo
-  if ask_yes_no "Create persistent udev rule to set scheduler for $SELECTED_NAME on boot?"; then
+  if ask_yes_no "Create systemd service to persist $persist_in for $SELECTED_NAME on boot?"; then
     # pick scheduler to persist (default to currently selected if any)
     cur=$(current_selected_scheduler "$sched_raw")
     # If the user previously applied one immediately, prefer that as default
@@ -351,7 +344,7 @@ main_interactive() {
       _yellow "Warning: failed to apply scheduler '$persist_in' immediately. Will still create udev rule to set it on next udev event."
     fi
 
-    make_udev_rule_for "$SELECTED_NAME" "$persist_in"
+    make_systemd_service "$SELECTED_NAME" "$persist_in"
   else
     _yellow "No persistent rule created."
   fi
@@ -371,7 +364,7 @@ ask_yes_no() {
 if [ "${1-}" = "--remove" ]; then
   check_root_or_sudo
   if [ -z "${2-}" ]; then echo "Usage: $PROG_NAME --remove <dev>"; exit 1; fi
-  remove_udev_rule_for "$2"; exit 0
+  remove_systemd_service "$2"; exit 0
 fi
 
 if [ "${1-}" = "--help" ] || [ "${1-}" = "-h" ]; then show_usage; fi
