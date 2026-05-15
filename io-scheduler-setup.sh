@@ -273,7 +273,14 @@ main_interactive() {
   fi
 
   # Parse tokens into array keeping bracketed selection visible
-  mapfile -t SCHED_TOKS < <(echo "$sched_raw" | sed -E 's/\[([^]]+)\]/\1/g' | tr -s ' ' | tr ' ' '\n')
+  mapfile -t SCHED_TOKS < <(echo "$sched_raw" | sed -E 's/\[([^]]+)\]/\1/g' | tr -s ' ' | sed 's/^ *//;s/ *$//' | tr ' ' '\n')
+
+  # Remove empty tokens from trailing spaces
+  local clean_toks=()
+  for tok in "${SCHED_TOKS[@]}"; do
+    [ -n "$tok" ] && clean_toks+=("$tok")
+  done
+  SCHED_TOKS=("${clean_toks[@]}")
 
   echo
   echo "Choose scheduler to apply now (or 's' to skip):"
@@ -297,7 +304,7 @@ main_interactive() {
   done
 
   echo
-  if ask_yes_no "Create systemd service to persist $default_sched for $SELECTED_NAME on boot?"; then
+  if ask_yes_no "Create systemd service to persist this scheduler for $SELECTED_NAME on boot?"; then
     # pick scheduler to persist (default to currently selected if any)
     cur=$(current_selected_scheduler "$sched_raw")
     # If the user previously applied one immediately, prefer that as default
