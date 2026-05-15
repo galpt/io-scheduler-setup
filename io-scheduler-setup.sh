@@ -221,18 +221,14 @@ make_udev_rule_for() {
   # defaults (e.g. 60-ioschedulers.rules from systemd-udev which sets nvme to 'none')
   echo "SUBSYSTEM==\"block\", KERNEL==\"$dev\", ATTR{queue/scheduler}=\"$sched\"" >> "$rulefile"
   _green "Wrote rule to $rulefile"
-  # Reload udev rules, trigger a change event, then wait for async rule processing
   udevadm control --reload-rules || true
-  udevadm trigger --action=change /sys/block/$dev || true
-  udevadm settle || true
-  # Verify the scheduler actually stuck
+  # Apply for the current session directly (udev rule fires on next add event / reboot)
+  echo "$sched" > "/sys/block/$dev/queue/scheduler" || true
   actual=$(cat "/sys/block/$dev/queue/scheduler" 2>/dev/null | sed -E 's/.*\[([^]]+)\].*/\1/' || true)
   if [ "$actual" = "$sched" ]; then
     _green "Confirmed: scheduler is now '$actual' on $dev"
   else
-    _yellow "Note: current scheduler on $dev is '$actual' — applying directly to ensure session state."
-    echo "$sched" > "/sys/block/$dev/queue/scheduler" || true
-    _green "Re-applied '$sched' directly to /sys/block/$dev/queue/scheduler"
+    _yellow "Note: could not verify '$sched' on $dev (current: '$actual')."
   fi
 }
 
